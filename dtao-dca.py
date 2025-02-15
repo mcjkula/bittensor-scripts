@@ -64,7 +64,7 @@ def read_schedule() -> dict:
         }
         with open(SCHEDULE_FILE, 'w') as f:
             json.dump(initial_data, f)
-        logger.info("Created staking_schedule.json with initial timestamp and interval")
+        logger.info("Created staking_schedule-data.json with initial timestamp and interval")
         return {
             "next_staking": datetime.fromisoformat(initial_data["next_staking"]),
             "interval_minutes": initial_data["interval_minutes"],
