@@ -3,7 +3,7 @@ import bittensor as bt
 from retry import retry
 import time
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 from typing import Dict, Tuple, List
 from rich.console import Console, Group
 from rich.table import Table
@@ -12,6 +12,10 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.style import Style
 from rich import box
+import os
+import json
+from pathlib import Path
+
 
 SUBNET_CONFIGS: Dict[int, Tuple[float, str]] = {
     1: (0.01, "validator-SS58"), # Enter the NETUID, amount to stake and the validator you want to staked with
@@ -22,11 +26,14 @@ SUBNET_CONFIGS: Dict[int, Tuple[float, str]] = {
 }
 
 ROOT_NETUID = 0
-STAKE_INTERVAL = timedelta(hours=6) # Define how often it should stake into subnets based on the configurations above
+ROOT_HOTKEY = "validator-SS58" # Enter the validator/hotkey you are staked with on your root stake (it only supports one)
 DIVIDEND_CHECK_INTERVAL = timedelta(seconds=60)
 MIN_ROOT_STAKE = 1 # Please enter the minimal amount you want to have on root, everything above it will be distributed across subnets
-MIN_STAKE_THRESHOLD = 0.0005 # Constant defined by the chain
+MIN_STAKE_THRESHOLD = 0.00055
+
 AUTO_MODE = True
+
+SCHEDULE_FILE = Path("staking_schedule.json")
 
 logging.basicConfig(
     filename='staking_operations.log',
@@ -40,10 +47,46 @@ console = Console()
 header_style = Style(color="bright_cyan", bold=True)
 value_style = Style(color="white", bold=True)
 
-wallet = bt.wallet(name="default") # Enter your wallet name instead
+wallet = bt.wallet(name="default")
 wallet.unlock_coldkey()
 
 history_log: List[str] = []
+
+def read_schedule() -> dict:
+    if not SCHEDULE_FILE.exists():
+        initial_data = {
+            "next_staking": "1999-01-01T00:00:00"
+        }
+        with open(SCHEDULE_FILE, 'w') as f:
+            json.dump(initial_data, f)
+        logger.info("Created staking_schedule.json with initial timestamp")
+        return {"next_staking": datetime.fromisoformat(initial_data["next_staking"])}
+
+    with open(SCHEDULE_FILE, 'r') as f:
+        data = json.load(f)
+        return {
+            "next_staking": datetime.fromisoformat(data["next_staking"]) if data["next_staking"] else None
+        }
+
+def write_schedule(next_staking: datetime) -> None:
+    data = {
+        "next_staking": next_staking.isoformat(),
+    }
+    with open(SCHEDULE_FILE, 'w') as f:
+        json.dump(data, f)
+
+def next_staking_time(reference_time: datetime = None) -> datetime:
+    """Calculate next stake time at 00:00, 06:00, 12:00, or 18:00 UTC""" # You would need to change this method to achieve different intervals of the scheduled stake
+    ref_time = reference_time or datetime.utcnow()
+
+    current_hour = ref_time.hour
+    next_hour = ((current_hour // 6) + 1) * 6
+
+    if next_hour >= 24:
+        next_day = ref_time.date() + timedelta(days=1)
+        return datetime.combine(next_day, dt_time(0, 0)).replace(tzinfo=ref_time.tzinfo)
+    else:
+        return datetime.combine(ref_time.date(), dt_time(next_hour, 0)).replace(tzinfo=ref_time.tzinfo)
 
 def append_history(message: str) -> None:
     timestamp = datetime.now().strftime("%H:%M:%S")
@@ -222,14 +265,14 @@ def create_staking_panel(next_staking: datetime, balance: float, total_required:
     )
 
 def create_subnet_panel(subnet_stakes: Dict[int, float]) -> Panel:
-    table = Table(title="Subnet Stakes (Î±)", box=box.ROUNDED, show_header=True, header_style="bold magenta", expand=True)
+    table = Table(title="Subnet Stakes (ÃŽÂ±)", box=box.ROUNDED, show_header=True, header_style="bold magenta", expand=True)
     table.add_column("Subnet", justify="right", style="cyan")
     table.add_column("Validator", style="white")
     table.add_column("Staked", justify="right", style="bold green")
     for netuid, (_, hotkey) in SUBNET_CONFIGS.items():
         stake = subnet_stakes.get(netuid, 0.0)
         validator = hotkey
-        table.add_row(str(netuid), validator, f"{stake:.5f} Î±")
+        table.add_row(str(netuid), validator, f"{stake:.5f} ÃŽÂ±")
     return Panel(table, title="[bold blue]Subnet Allocations[/bold blue]", border_style="blue", box=box.ROUNDED, padding=(1, 1))
 
 def create_history_panel(history: List[str]) -> Panel:
@@ -252,14 +295,30 @@ def create_history_panel(history: List[str]) -> Panel:
 
 async def staking_manager(subtensor: bt.AsyncSubtensor, wallet: bt.wallet, live: Live):
     coldkey = wallet.coldkeypub.ss58_address
-    root_hotkey = "validator-SS58" # Enter the hotkey you are staking with on root (only supports one)
+    root_hotkey = ROOT_HOTKEY
     total_required = sum(amount for amount, _ in SUBNET_CONFIGS.values())
-    last_div_check = datetime.now()
+    last_div_check = datetime.utcnow()
+
+    current_stake = await get_stake(subtensor, coldkey, root_hotkey, ROOT_NETUID)
+    balance = await get_balance(subtensor, wallet.coldkeypub.ss58_address)
+    excess = current_stake.tao - MIN_ROOT_STAKE
+    required_excess = MIN_STAKE_THRESHOLD * len(SUBNET_CONFIGS)
+    next_div_check = last_div_check + DIVIDEND_CHECK_INTERVAL
+    time_until_div = next_div_check - datetime.utcnow()
 
     subnet_stakes = {netuid: 0.0 for netuid in SUBNET_CONFIGS.keys()}
 
+    schedule = read_schedule()
+    original_next_staking = schedule["next_staking"] or next_staking_time()
+    next_staking = original_next_staking
+
+    if datetime.utcnow() > original_next_staking:
+        console.print("[yellow]âš ï¸  Recovering missed scheduled stake[/yellow]")
+        next_staking = datetime.utcnow()
+        append_history("Recovering missed scheduled stake")
+
     async def update_dashboard():
-        nonlocal current_stake, balance, excess, required_excess, next_staking, next_div_check, time_until_div
+        nonlocal current_stake, balance, excess, required_excess, next_div_check, time_until_div
 
         try:
             current_stake = await get_stake(subtensor, coldkey, root_hotkey, ROOT_NETUID)
@@ -271,9 +330,8 @@ async def staking_manager(subtensor: bt.AsyncSubtensor, wallet: bt.wallet, live:
 
             excess = current_stake.tao - MIN_ROOT_STAKE
             required_excess = MIN_STAKE_THRESHOLD * len(SUBNET_CONFIGS)
-            next_staking = next_staking_time()
             next_div_check = last_div_check + DIVIDEND_CHECK_INTERVAL
-            time_until_div = next_div_check - datetime.now()
+            time_until_div = next_div_check - datetime.utcnow()
 
             dividend_panel = create_dividend_panel(current_stake.tao, excess, required_excess, time_until_div)
             staking_panel = create_staking_panel(next_staking, balance.tao, total_required)
@@ -299,27 +357,19 @@ async def staking_manager(subtensor: bt.AsyncSubtensor, wallet: bt.wallet, live:
             logger.error(f"Dashboard update failed: {e}")
             live.update(Panel("[red]Dashboard update failed: Check logs[/red]", title="[bold]ALPHA Stake Manager[/bold]", border_style="red", box=box.ROUNDED))
 
-    current_stake = await get_stake(subtensor, coldkey, root_hotkey, ROOT_NETUID)
-    balance = await get_balance(subtensor, wallet.coldkeypub.ss58_address)
-    excess = current_stake.tao - MIN_ROOT_STAKE
-    required_excess = MIN_STAKE_THRESHOLD * len(SUBNET_CONFIGS)
-    next_staking = next_staking_time()
-    next_div_check = last_div_check + DIVIDEND_CHECK_INTERVAL
-    time_until_div = next_div_check - datetime.now()
-
     dashboard = Group(
-        create_dividend_panel(current_stake.tao, excess, required_excess, time_until_div),
+        create_dividend_panel(current_stake.tao, excess, required_excess, timedelta(0)),
         create_staking_panel(next_staking, balance.tao, total_required),
         create_subnet_panel(subnet_stakes),
         create_history_panel(history_log)
     )
-
     live.update(dashboard)
 
     while True:
         try:
             await update_dashboard()
-            if datetime.now() >= next_div_check:
+
+            if datetime.utcnow() >= last_div_check + DIVIDEND_CHECK_INTERVAL:
                 if current_stake.tao > MIN_ROOT_STAKE and excess >= required_excess:
                     actual_unstaked = await unstake_excess(subtensor, wallet, ROOT_NETUID, root_hotkey, excess)
                     if actual_unstaked > 0:
@@ -329,7 +379,6 @@ async def staking_manager(subtensor: bt.AsyncSubtensor, wallet: bt.wallet, live:
                             try:
                                 await process_subnet(subtensor, wallet, netuid, per_subnet, hotkey)
                                 successful_subnets += 1
-
                                 await update_dashboard()
                                 await asyncio.sleep(0)
                             except Exception as e:
@@ -341,12 +390,20 @@ async def staking_manager(subtensor: bt.AsyncSubtensor, wallet: bt.wallet, live:
                         append_history("No funds available for distribution")
                 else:
                     append_history("Dividend check - insufficient excess")
-                last_div_check = datetime.now()
+                last_div_check = datetime.utcnow()
 
-            if datetime.now() >= next_staking and balance.tao >= total_required:
+            if datetime.utcnow() >= next_staking and balance.tao >= total_required:
                 for netuid, (amount, hotkey) in SUBNET_CONFIGS.items():
                     await process_subnet(subtensor, wallet, netuid, amount, hotkey)
-                append_history("Processed scheduled staking cycle")
+
+                new_next = original_next_staking + STAKE_INTERVAL
+                while new_next < datetime.utcnow():
+                    new_next += STAKE_INTERVAL
+
+                write_schedule(new_next)
+                next_staking = new_next
+                original_next_staking = new_next
+                append_history(f"Scheduled stake completed. Next at {new_next.strftime('%H:%M UTC')}")
 
             await asyncio.sleep(1)
 
@@ -360,13 +417,6 @@ async def staking_manager(subtensor: bt.AsyncSubtensor, wallet: bt.wallet, live:
             ))
             append_history("Error occurred in manager")
             await asyncio.sleep(10)
-
-def next_staking_time() -> datetime:
-    now = datetime.now()
-    next_hour = ((now.hour // 6) * 6) + 6
-    if next_hour >= 24:
-        return datetime(now.year, now.month, now.day + 1, 0)
-    return datetime(now.year, now.month, now.day, next_hour)
 
 async def main():
     console.print(Panel.fit(
