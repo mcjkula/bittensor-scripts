@@ -337,9 +337,9 @@ async def staking_manager(subtensor: bt.AsyncSubtensor, wallet: bt.wallet, live:
         append_history("Interval changed; recalculating next staking time")
 
     if next_staking is None or datetime.utcnow() > next_staking:
-        console.print("[yellow]Ã¢Å¡ Ã¯Â¸Â  Recovering missed scheduled stake[/yellow]")
+        console.print("[yellow]Ã¢Å¡ Ã¯Â¸Â  Recalculating from missed schedule [/yellow]")
         next_staking = next_staking_time(interval_minutes=INTERVAL_MINUTES)
-        append_history("Recovering missed scheduled stake")
+        append_history("Recalculating from missed schedule")
 
     async def update_dashboard():
         nonlocal current_stake, balance, excess, required_excess, next_div_check, time_until_div, next_staking
