@@ -123,7 +123,7 @@ def user_confirmation(prompt: str) -> bool:
 async def get_stake(subtensor: bt.AsyncSubtensor, coldkey: str, hotkey: str, netuid: int) -> bt.Balance:
     try:
         stake = await subtensor.get_stake(coldkey_ss58=coldkey, hotkey_ss58=hotkey, netuid=netuid)
-        logger.info(f"[Net {netuid}] Current stake: {stake.tao:.5f} TAO")
+        logger.info(f"[Net {netuid}] Current stake: {stake.tao:.5f} ALPHA")
         return stake
     except Exception as e:
         logger.error(f"Failed to get stake for {hotkey} on net {netuid}: {e}")
@@ -194,7 +194,7 @@ async def stake_dividend(subtensor: bt.AsyncSubtensor, wallet: bt.wallet, netuid
     try:
         initial = await get_stake(subtensor, coldkey, hotkey, netuid)
 
-        logger.info(f"[Net {netuid}] Request to stake {amount:.5f} TAO (Current stake: {initial.tao:.5f} TAO)")
+        logger.info(f"[Net {netuid}] Request to stake {amount:.5f} TAO (Current stake: {initial.tao:.5f} ALPHA)")
         if not user_confirmation(f"Stake {amount:.5f} TAO on network {netuid}?"):
             logger.info("Staking cancelled by user")
             append_history(f"Cancelled staking on Net {netuid}")
@@ -209,7 +209,7 @@ async def stake_dividend(subtensor: bt.AsyncSubtensor, wallet: bt.wallet, netuid
         await asyncio.sleep(3)
         new_stake = await get_stake(subtensor, coldkey, hotkey, netuid)
 
-        logger.info(f"[Net {netuid}] Staked. New stake: {new_stake.tao:.5f} TAO (was {initial.tao:.5f} TAO)")
+        logger.info(f"[Net {netuid}] Staked. New stake: {new_stake.tao:.5f} ALPHA (was {initial.tao:.5f} ALPHA)")
         append_history(f"Staked {amount:.5f} TAO on Net {netuid}")
         return amount
     except Exception as e:
