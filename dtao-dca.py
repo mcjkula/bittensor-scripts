@@ -27,13 +27,17 @@ SUBNET_CONFIGS: Dict[int, Tuple[float, str]] = {
 
 ROOT_NETUID = 0
 ROOT_HOTKEY = "validator-SS58" # Enter the validator/hotkey you are staked with on your root stake (it only supports one)
+
+INTERVAL_MINUTES = 360
 DIVIDEND_CHECK_INTERVAL = timedelta(seconds=60)
-MIN_ROOT_STAKE = 1 # Please enter the minimal amount you want to have on root, everything above it will be distributed across subnets
+
+# Please enter the minimal amount you want to have on root (everything above it will be distributed across subnets!)
+MIN_ROOT_STAKE = 1.0
 MIN_STAKE_THRESHOLD = 0.00055
 
 AUTO_MODE = True
 
-SCHEDULE_FILE = Path("staking_schedule.json")
+SCHEDULE_FILE = Path("staking_schedule-data.json")
 
 logging.basicConfig(
     filename='staking_operations.log',
@@ -55,38 +59,53 @@ history_log: List[str] = []
 def read_schedule() -> dict:
     if not SCHEDULE_FILE.exists():
         initial_data = {
-            "next_staking": "1999-01-01T00:00:00"
+            "next_staking": "1999-01-01T00:00:00",
+            "interval_minutes": INTERVAL_MINUTES,
         }
         with open(SCHEDULE_FILE, 'w') as f:
             json.dump(initial_data, f)
-        logger.info("Created staking_schedule.json with initial timestamp")
-        return {"next_staking": datetime.fromisoformat(initial_data["next_staking"])}
+        logger.info("Created staking_schedule.json with initial timestamp and interval")
+        return {
+            "next_staking": datetime.fromisoformat(initial_data["next_staking"]),
+            "interval_minutes": initial_data["interval_minutes"],
+        }
 
     with open(SCHEDULE_FILE, 'r') as f:
         data = json.load(f)
         return {
-            "next_staking": datetime.fromisoformat(data["next_staking"]) if data["next_staking"] else None
+            "next_staking": datetime.fromisoformat(data["next_staking"]) if data["next_staking"] else None,
+            "interval_minutes": data.get("interval_minutes", INTERVAL_MINUTES),
         }
 
-def write_schedule(next_staking: datetime) -> None:
+def write_schedule(next_staking: datetime, interval_minutes: int) -> None:
     data = {
         "next_staking": next_staking.isoformat(),
+        "interval_minutes": interval_minutes,
     }
     with open(SCHEDULE_FILE, 'w') as f:
         json.dump(data, f)
 
-def next_staking_time(reference_time: datetime = None) -> datetime:
-    """Calculate next stake time at 00:00, 06:00, 12:00, or 18:00 UTC""" # You would need to change this method to achieve different intervals of the scheduled stake
+def next_staking_time(reference_time: datetime = None, interval_minutes: int = INTERVAL_MINUTES) -> datetime:
+    if interval_minutes <= 0:
+        raise ValueError("Interval must be greater than 0 minutes")
+
     ref_time = reference_time or datetime.utcnow()
 
-    current_hour = ref_time.hour
-    next_hour = ((current_hour // 6) + 1) * 6
+    minutes_since_midnight = ref_time.hour * 60 + ref_time.minute
 
-    if next_hour >= 24:
+    next_interval = ((minutes_since_midnight // interval_minutes) + 1) * interval_minutes
+
+    if next_interval >= 24 * 60:
         next_day = ref_time.date() + timedelta(days=1)
         return datetime.combine(next_day, dt_time(0, 0)).replace(tzinfo=ref_time.tzinfo)
-    else:
-        return datetime.combine(ref_time.date(), dt_time(next_hour, 0)).replace(tzinfo=ref_time.tzinfo)
+
+    next_hours = next_interval // 60
+    next_minutes = next_interval % 60
+
+    return datetime.combine(
+        ref_time.date(),
+        dt_time(next_hours, next_minutes)
+    ).replace(tzinfo=ref_time.tzinfo)
 
 def append_history(message: str) -> None:
     timestamp = datetime.now().strftime("%H:%M:%S")
@@ -265,14 +284,14 @@ def create_staking_panel(next_staking: datetime, balance: float, total_required:
     )
 
 def create_subnet_panel(subnet_stakes: Dict[int, float]) -> Panel:
-    table = Table(title="Subnet Stakes (ÃŽÂ±)", box=box.ROUNDED, show_header=True, header_style="bold magenta", expand=True)
+    table = Table(title="Subnet Stakes (ÃƒÅ½Ã‚Â±)", box=box.ROUNDED, show_header=True, header_style="bold magenta", expand=True)
     table.add_column("Subnet", justify="right", style="cyan")
     table.add_column("Validator", style="white")
     table.add_column("Staked", justify="right", style="bold green")
     for netuid, (_, hotkey) in SUBNET_CONFIGS.items():
         stake = subnet_stakes.get(netuid, 0.0)
         validator = hotkey
-        table.add_row(str(netuid), validator, f"{stake:.5f} ÃŽÂ±")
+        table.add_row(str(netuid), validator, f"{stake:.5f} ÃƒÅ½Ã‚Â±")
     return Panel(table, title="[bold blue]Subnet Allocations[/bold blue]", border_style="blue", box=box.ROUNDED, padding=(1, 1))
 
 def create_history_panel(history: List[str]) -> Panel:
@@ -309,16 +328,21 @@ async def staking_manager(subtensor: bt.AsyncSubtensor, wallet: bt.wallet, live:
     subnet_stakes = {netuid: 0.0 for netuid in SUBNET_CONFIGS.keys()}
 
     schedule = read_schedule()
-    original_next_staking = schedule["next_staking"] or next_staking_time()
-    next_staking = original_next_staking
+    next_staking = schedule["next_staking"]
+    interval_minutes = schedule["interval_minutes"]
 
-    if datetime.utcnow() > original_next_staking:
-        console.print("[yellow]âš ï¸  Recovering missed scheduled stake[/yellow]")
-        next_staking = datetime.utcnow()
+    if interval_minutes != INTERVAL_MINUTES:
+        console.print("[yellow]Ã¢Å¡ Ã¯Â¸Â  Interval changed; recalculating next staking time[/yellow]")
+        next_staking = next_staking_time(interval_minutes=INTERVAL_MINUTES)
+        append_history("Interval changed; recalculating next staking time")
+
+    if next_staking is None or datetime.utcnow() > next_staking:
+        console.print("[yellow]Ã¢Å¡ Ã¯Â¸Â  Recovering missed scheduled stake[/yellow]")
+        next_staking = next_staking_time(interval_minutes=INTERVAL_MINUTES)
         append_history("Recovering missed scheduled stake")
 
     async def update_dashboard():
-        nonlocal current_stake, balance, excess, required_excess, next_div_check, time_until_div
+        nonlocal current_stake, balance, excess, required_excess, next_div_check, time_until_div, next_staking
 
         try:
             current_stake = await get_stake(subtensor, coldkey, root_hotkey, ROOT_NETUID)
@@ -355,7 +379,7 @@ async def staking_manager(subtensor: bt.AsyncSubtensor, wallet: bt.wallet, live:
             live.update(dashboard)
         except Exception as e:
             logger.error(f"Dashboard update failed: {e}")
-            live.update(Panel("[red]Dashboard update failed: Check logs[/red]", title="[bold]ALPHA Stake Manager[/bold]", border_style="red", box=box.ROUNDED))
+            live.update(Panel("[red]Dashboard update failed: Check logs[/red]", title="[bold]DCA Script[/bold]", border_style="red", box=box.ROUNDED))
 
     dashboard = Group(
         create_dividend_panel(current_stake.tao, excess, required_excess, timedelta(0)),
@@ -396,13 +420,9 @@ async def staking_manager(subtensor: bt.AsyncSubtensor, wallet: bt.wallet, live:
                 for netuid, (amount, hotkey) in SUBNET_CONFIGS.items():
                     await process_subnet(subtensor, wallet, netuid, amount, hotkey)
 
-                new_next = original_next_staking + STAKE_INTERVAL
-                while new_next < datetime.utcnow():
-                    new_next += STAKE_INTERVAL
-
-                write_schedule(new_next)
+                new_next = next_staking_time(interval_minutes=INTERVAL_MINUTES)
+                write_schedule(new_next, INTERVAL_MINUTES)
                 next_staking = new_next
-                original_next_staking = new_next
                 append_history(f"Scheduled stake completed. Next at {new_next.strftime('%H:%M UTC')}")
 
             await asyncio.sleep(1)
@@ -411,7 +431,7 @@ async def staking_manager(subtensor: bt.AsyncSubtensor, wallet: bt.wallet, live:
             logger.error(f"Manager error: {str(e)}")
             live.update(Panel(
                 "[red]Error occurred - check logs[/red]",
-                title="[bold]ALPHA Stake Manager[/bold]",
+                title="[bold]DCA Script[/bold]",
                 border_style="red",
                 box=box.ROUNDED
             ))
@@ -420,7 +440,7 @@ async def staking_manager(subtensor: bt.AsyncSubtensor, wallet: bt.wallet, live:
 
 async def main():
     console.print(Panel.fit(
-        "[bold #38bdf8]Initializing ALPHA Stake Manager...[/bold #38bdf8]",
+        "[bold #38bdf8]Initializing DCA Script...[/bold #38bdf8]",
         title="Startup Sequence",
         border_style="#1e40af",
         style="on #0F172A"
